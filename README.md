@@ -2,7 +2,7 @@
 
 [中文版](./README_zh.md)
 
-[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/YOUR_USERNAME/YOUR_REPO_NAME)
+[![Deploy to Cloudflare Workers](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Pizone-ai/rssflow-mcp-bridge)
 
 ---
 
@@ -56,6 +56,28 @@ Once deployed, you need to connect this bridge to your RSSFlow application:
     - **Telegram Binding**: Send `/bind YOUR_IDENTITY_KEY` to your bot to link the Telegram chat with your RSSFlow instance.
 
 4. **Verify**: The client will automatically attempt to communicate with your MCP environment through the bridge.
+
+---
+
+### 🤖 Telegram Chat Configuration
+
+This Worker supports two distinct modes:
+1. **Standard MCP Mode**: For AI editors like Cursor/Claude Desktop, using `streamableHttp`.
+2. **Telegram Chat Mode**: For direct dialogue, notifications, and commands via a Telegram Bot.
+
+#### 1. Set Bot Token (TG_BOT_TOKEN)
+You can set your bot key using either method:
+
+- **Method A (CLI - Recommended)**: Run `npx wrangler secret put TG_BOT_TOKEN` and enter your token when prompted.
+- **Method B (Cloudflare Dashboard)**: Go to your Worker -> **Settings** -> **Variables**. Under **Environment Variables**, click "Add variable". Name: `TG_BOT_TOKEN`, Value: your token. Click **Save and deploy**.
+
+#### 2. Multi-Bot Support (Advanced)
+If you need to connect multiple bots simultaneously:
+- **Primary (Default) Bot**: Env name is `TG_BOT_TOKEN`.
+- **Additional Bots**: Env name follows the format `TG_BOT_TOKEN_YOUR_ID` (e.g., `TG_BOT_TOKEN_MYBOT`).
+- **Webhook Activation Link**:
+  - Default: `https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<your-worker>.workers.dev/webhook/telegram/`
+  - Named Bot: `https://api.telegram.org/bot<TOKEN>/setWebhook?url=https://<your-worker>.workers.dev/webhook/telegram/YOUR_ID`
 
 ---
 
