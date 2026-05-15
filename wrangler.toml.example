@@ -1,0 +1,14 @@
+name = "rssflow-mcp-bridge"
+main = "src/index.ts"
+compatibility_date = "2024-02-22"
+compatibility_flags = ["nodejs_compat"]
+
+# KV Namespace binding for the bridge queue and auth
+# You will need to replace the id with your actual KV namespace ID after creating it
+[[kv_namespaces]]
+binding = "RSSFLOW_BRIDGE_KV"
+id = "YOUR_KV_NAMESPACE_ID"
+preview_id = "YOUR_PREVIEW_ID"
+
+[vars]
+# TELEGRAM_BOT_TOKEN should be managed via 'wrangler secret put TG_BOT_TOKEN'
