@@ -6,7 +6,8 @@ import {
   getBridgeKeyByTarget, 
   enqueueMessage, 
   getMessages, 
-  dequeueMessageAck 
+  dequeueMessageAck,
+  getBridgeConfig
 } from './utils/kvHelper';
 
 const app = new Hono<{ Bindings: Env }>();
@@ -181,6 +182,82 @@ app.post('/webhook/telegram/:botId?', async (c) => {
   return c.json({ ok: true });
 });
 
+// =========================================================================
+// Webhook (Feishu/Lark)
+// =========================================================================
+app.post('/webhook/feishu', async (c) => {
+  const rawBody = await c.req.text();
+  let body: any;
+
+  try {
+    body = JSON.parse(rawBody);
+  } catch {
+    return c.json({ error: 'Invalid JSON body' }, 400);
+  }
+
+  // 1. 响应 URL 验证
+  if (body.type === 'url_verification') {
+    const tokenCheck = verifyFeishuVerificationToken(c.env, body);
+    if (!tokenCheck.ok) return c.json({ error: tokenCheck.error }, 403);
+    return c.json({ challenge: body.challenge });
+  }
+
+  const signatureCheck = await verifyFeishuSignature(c.env, c.req.raw.headers, rawBody);
+  if (!signatureCheck.ok) return c.json({ error: signatureCheck.error }, 403);
+
+  const normalizedBodyResult = await normalizeFeishuEventBody(c.env, body);
+  if (!normalizedBodyResult.ok) return c.json({ error: normalizedBodyResult.error }, 400);
+
+  body = normalizedBodyResult.body;
+
+  const tokenCheck = verifyFeishuVerificationToken(c.env, body);
+  if (!tokenCheck.ok) return c.json({ error: tokenCheck.error }, 403);
+
+  if (body.type === 'url_verification') {
+    return c.json({ challenge: body.challenge });
+  }
+
+  // 2. 响应事件回调 (v2.0 格式)
+  if (body.header && body.event) {
+    const { event_type } = body.header;
+    
+    // 只处理消息接收事件
+    if (event_type === 'im.message.receive_v1') {
+      const { message } = body.event;
+      if (message.message_type !== 'text') return c.json({ ok: true });
+
+      const chatId = message.chat_id;
+      const content = JSON.parse(message.content);
+      const text = content.text.trim();
+      const messageId = message.message_id;
+
+      // 绑定逻辑
+      if (text.startsWith('/bind ')) {
+        const key = text.replace('/bind ', '').trim();
+        await bindBridgeKey(c.env, 'feishu', chatId, key);
+        // 注意：回复飞书需要 AppId/Secret
+        const appId = c.env.FEISHU_APP_ID;
+        const appSecret = c.env.FEISHU_APP_SECRET;
+        if (appId && appSecret) {
+          await sendFeishu(c.env, appId, appSecret, chatId, "✅ RSSFlow 绑定成功！Key: " + key);
+        }
+        return c.json({ ok: true });
+      }
+
+      const bridgeKey = await getBridgeKeyByTarget(c.env, 'feishu', chatId);
+      if (!bridgeKey) return c.json({ ok: true });
+
+      await enqueueMessage(c.env, bridgeKey, {
+        jsonrpc: "2.0", id: `msg_${Date.now()}`, method: "mcp.chat",
+        params: { text, messageId },
+        metadata: { source: 'feishu', chatId, timestamp: Date.now() }
+      });
+    }
+  }
+
+  return c.json({ ok: true });
+});
+
 app.get('/poll', async (c) => {
   const bridgeKey = c.req.query('key');
   if (!bridgeKey) return c.json({ error: 'Missing key' }, 400);
@@ -213,11 +290,25 @@ app.get('/debug_queue', async (c) => {
 
 app.post('/reply', async (c) => {
   const body = await c.req.json();
-  const { bridgeKey, text, platform, chatId, botId, msgId } = body;
+  const { bridgeKey, text, platform, chatId, botId, msgId, feishuAppId, feishuAppSecret } = body;
   if (!bridgeKey || !text) return c.json({ error: 'Missing params' }, 400);
 
   if (platform === 'telegram') {
     await sendTG(getBotToken(c.env, botId), chatId, text, 'Markdown');
+  } else if (platform === 'feishu') {
+    const appId = feishuAppId || c.env.FEISHU_APP_ID;
+    const appSecret = feishuAppSecret || c.env.FEISHU_APP_SECRET;
+    if (!appId || !appSecret) {
+      return c.json({ error: 'Feishu credentials missing on bridge' }, 400);
+    }
+    if (!chatId) {
+      return c.json({ error: 'Missing Feishu chatId' }, 400);
+    }
+
+    const result = await sendFeishu(c.env, appId, appSecret, chatId, text);
+    if (!result.ok) {
+      return c.json({ error: result.error }, 502);
+    }
   }
 
   if (msgId) await dequeueMessageAck(c.env, bridgeKey, msgId);
@@ -228,6 +319,44 @@ app.post('/ack', async (c) => {
   const { bridgeKey, msgId } = await c.req.json();
   if (!bridgeKey || !msgId) return c.json({ error: 'Missing bridgeKey or msgId' }, 400);
   await dequeueMessageAck(c.env, bridgeKey, msgId);
+  return c.json({ success: true });
+});
+
+app.post('/push', async (c) => {
+  const body = await c.req.json();
+  const { bridgeKey, text, platform: overridePlatform, chatId: overrideChatId, feishuAppId, feishuAppSecret, botId } = body;
+  
+  if (!bridgeKey || !text) return c.json({ error: 'Missing bridgeKey or text' }, 400);
+
+  let targetPlatform = overridePlatform;
+  let targetChatId = overrideChatId;
+
+  // 如果没有提供明确的 platform/chatId，尝试从绑定配置中读取
+  if (!targetPlatform || !targetChatId) {
+    const config = await getBridgeConfig(c.env, bridgeKey);
+    if (config) {
+      targetPlatform = targetPlatform || config.platform;
+      targetChatId = targetChatId || config.chatId;
+    }
+  }
+
+  if (!targetPlatform || !targetChatId) {
+    return c.json({ error: 'No bound target found for this bridgeKey. Please /bind first.' }, 404);
+  }
+
+  if (targetPlatform === 'telegram') {
+    await sendTG(getBotToken(c.env, botId), targetChatId, text, 'Markdown');
+  } else if (targetPlatform === 'feishu') {
+    const appId = feishuAppId || c.env.FEISHU_APP_ID;
+    const appSecret = feishuAppSecret || c.env.FEISHU_APP_SECRET;
+    if (appId && appSecret) {
+      const result = await sendFeishu(c.env, appId, appSecret, targetChatId, text);
+      if (!result.ok) return c.json({ error: result.error }, 502);
+    } else {
+      return c.json({ error: 'Feishu credentials missing on bridge' }, 400);
+    }
+  }
+
   return c.json({ success: true });
 });
 
@@ -252,6 +381,133 @@ async function sendTG(token: string, chatId: string, text: string, parse_mode?: 
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ chat_id: chatId, text, parse_mode })
   });
+}
+
+async function getFeishuToken(env: Env, appId: string, appSecret: string): Promise<string | null> {
+  const CACHE_KEY = `feishu_token:${appId}`;
+  const cached = await env.RSSFLOW_BRIDGE_KV.get(CACHE_KEY);
+  if (cached) return cached;
+
+  const resp = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ app_id: appId, app_secret: appSecret })
+  });
+  
+  const data: any = await resp.json();
+  if (data.code === 0 && data.tenant_access_token) {
+    // 缓存 Token，比有效期少 1 分钟以保安全
+    await env.RSSFLOW_BRIDGE_KV.put(CACHE_KEY, data.tenant_access_token, { 
+      expirationTtl: Math.max(60, data.expire - 60) 
+    });
+    return data.tenant_access_token;
+  }
+  return null;
+}
+
+async function sendFeishu(env: Env, appId: string, appSecret: string, chatId: string, text: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const token = await getFeishuToken(env, appId, appSecret);
+  if (!token) return { ok: false, error: 'Failed to acquire Feishu tenant_access_token' };
+
+  const resp = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${token}`
+    },
+    body: JSON.stringify({
+      receive_id: chatId,
+      msg_type: 'text',
+      content: JSON.stringify({ text })
+    })
+  });
+
+  const data: any = await resp.json().catch(() => null);
+  if (!resp.ok || (data && typeof data.code === 'number' && data.code !== 0)) {
+    return { ok: false, error: `Feishu send failed: ${data?.msg || data?.message || resp.statusText || resp.status}` };
+  }
+
+  return { ok: true };
+}
+
+function verifyFeishuVerificationToken(env: Env, body: any): { ok: true } | { ok: false; error: string } {
+  const expectedToken = env.FEISHU_VERIFICATION_TOKEN;
+  if (!expectedToken) return { ok: true };
+
+  const actualToken = body?.token || body?.header?.token;
+  if (actualToken !== expectedToken) {
+    return { ok: false, error: 'Invalid Feishu verification token' };
+  }
+
+  return { ok: true };
+}
+
+async function verifyFeishuSignature(env: Env, headers: Headers, rawBody: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const encryptKey = env.FEISHU_ENCRYPT_KEY;
+  if (!encryptKey) return { ok: true };
+
+  const timestamp = headers.get('X-Lark-Request-Timestamp') || headers.get('x-lark-request-timestamp');
+  const nonce = headers.get('X-Lark-Request-Nonce') || headers.get('x-lark-request-nonce');
+  const signature = headers.get('X-Lark-Signature') || headers.get('x-lark-signature');
+
+  if (!timestamp || !nonce || !signature) {
+    return { ok: false, error: 'Missing Feishu signature headers' };
+  }
+
+  const expectedSignature = await sha256Hex(`${timestamp}${nonce}${encryptKey}${rawBody}`);
+  if (!safeEqual(expectedSignature, signature)) {
+    return { ok: false, error: 'Invalid Feishu signature' };
+  }
+
+  return { ok: true };
+}
+
+async function normalizeFeishuEventBody(env: Env, body: any): Promise<{ ok: true; body: any } | { ok: false; error: string }> {
+  if (!body?.encrypt) return { ok: true, body };
+
+  const encryptKey = env.FEISHU_ENCRYPT_KEY;
+  if (!encryptKey) {
+    return { ok: false, error: 'Encrypted Feishu event received but FEISHU_ENCRYPT_KEY is not configured' };
+  }
+
+  try {
+    const decryptedText = await decryptFeishuEvent(body.encrypt, encryptKey);
+    return { ok: true, body: JSON.parse(decryptedText) };
+  } catch (error: any) {
+    return { ok: false, error: `Failed to decrypt Feishu event: ${error?.message || error}` };
+  }
+}
+
+async function decryptFeishuEvent(encryptedPayload: string, encryptKey: string): Promise<string> {
+  const encryptedBytes = base64ToBytes(encryptedPayload);
+  if (encryptedBytes.length <= 16) throw new Error('ciphertext too short');
+
+  const keyBytes = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(encryptKey));
+  const cryptoKey = await crypto.subtle.importKey('raw', keyBytes, { name: 'AES-CBC' }, false, ['decrypt']);
+  const iv = encryptedBytes.slice(0, 16);
+  const ciphertext = encryptedBytes.slice(16);
+  const decrypted = await crypto.subtle.decrypt({ name: 'AES-CBC', iv }, cryptoKey, ciphertext);
+
+  return new TextDecoder().decode(decrypted).trim();
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input));
+  return Array.from(new Uint8Array(digest)).map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let result = 0;
+  for (let i = 0; i < a.length; i++) result |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return result === 0;
 }
 
 export default app;
