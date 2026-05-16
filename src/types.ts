@@ -4,6 +4,7 @@ export type Platform = 'telegram' | 'feishu';
 export interface Env {
   RSSFLOW_BRIDGE_KV: KVNamespace;
   TG_BOT_TOKEN: string;
+  TG_BOT_USERNAME?: string;
   FEISHU_APP_ID?: string;
   FEISHU_APP_SECRET?: string;
   FEISHU_VERIFICATION_TOKEN?: string;
@@ -31,6 +32,7 @@ export interface InternalMessage {
   metadata: {
     source: Platform | 'mcp_remote';
     chatId?: string;
+    chatType?: string;
     timestamp: number;
     botId?: string; // 机器人标识符 (例如 "2")
   };

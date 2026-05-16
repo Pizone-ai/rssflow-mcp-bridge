@@ -7,8 +7,7 @@ export async function enqueueMessage(env: Env, bridgeKey: string, message: Inter
   const queueKey = `queue:${bridgeKey}`;
   
   // 乐观读取
-  const currentStr = await env.RSSFLOW_BRIDGE_KV.get(queueKey);
-  const queue: InternalMessage[] = currentStr ? JSON.parse(currentStr) : [];
+  const queue = await readQueue(env, queueKey);
   
   queue.push(message);
   
@@ -22,9 +21,7 @@ export async function enqueueMessage(env: Env, bridgeKey: string, message: Inter
 export async function getMessages(env: Env, bridgeKey: string): Promise<InternalMessage[]> {
   const queueKey = `queue:${bridgeKey}`;
   // get 远快于 list，通常修改后能在 1s 内同步到最近的 Edge 节点
-  const currentStr = await env.RSSFLOW_BRIDGE_KV.get(queueKey);
-  if (!currentStr) return [];
-  return JSON.parse(currentStr);
+  return readQueue(env, queueKey);
 }
 
 /**
@@ -32,10 +29,8 @@ export async function getMessages(env: Env, bridgeKey: string): Promise<Internal
  */
 export async function dequeueMessageAck(env: Env, bridgeKey: string, msgId: string): Promise<void> {
   const queueKey = `queue:${bridgeKey}`;
-  const currentStr = await env.RSSFLOW_BRIDGE_KV.get(queueKey);
-  if (!currentStr) return;
-  
-  let queue: InternalMessage[] = JSON.parse(currentStr);
+  let queue = await readQueue(env, queueKey);
+  if (queue.length === 0) return;
   const initialLength = queue.length;
   
   // 过滤掉已处理的
@@ -56,7 +51,7 @@ export async function dequeueMessageAck(env: Env, bridgeKey: string, msgId: stri
  */
 export async function getBridgeConfig(env: Env, bridgeKey: string): Promise<BridgeConfig | null> {
   const configStr = await env.RSSFLOW_BRIDGE_KV.get(`config:${bridgeKey}`);
-  return configStr ? JSON.parse(configStr) : null;
+  return parseJsonOrNull<BridgeConfig>(configStr);
 }
 
 /**
@@ -80,4 +75,19 @@ export async function bindBridgeKey(env: Env, platform: string, chatId: string, 
  */
 export async function getBridgeKeyByTarget(env: Env, platform: string, chatId: string): Promise<string | null> {
   return await env.RSSFLOW_BRIDGE_KV.get(`target:${platform}:${chatId}`);
+}
+
+async function readQueue(env: Env, queueKey: string): Promise<InternalMessage[]> {
+  const currentStr = await env.RSSFLOW_BRIDGE_KV.get(queueKey);
+  const queue = parseJsonOrNull<InternalMessage[]>(currentStr);
+  return Array.isArray(queue) ? queue : [];
+}
+
+function parseJsonOrNull<T>(value: string | null): T | null {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
 }

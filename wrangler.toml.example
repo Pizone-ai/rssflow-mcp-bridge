@@ -12,3 +12,8 @@ preview_id = "YOUR_PREVIEW_ID"
 
 [vars]
 # TELEGRAM_BOT_TOKEN should be managed via 'wrangler secret put TG_BOT_TOKEN'
+# Recommended for Telegram group chats.
+# Set this to your bot username without "@" so normal group messages are ignored,
+# and only @BotUsername messages, /command@BotUsername, or replies to the bot are handled.
+# Without this value, group chats can still use /bind, but @BotUsername text cannot be identified safely.
+TG_BOT_USERNAME = "YOUR_BOT_USERNAME"
